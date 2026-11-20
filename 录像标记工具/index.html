@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>交通录像标记小工具</title>
+  <style>
+    body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; max-width: 880px; margin: 24px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 20px; margin-bottom: 12px; }
+    h2 { font-size: 16px; margin-top: 24px; }
+    .video-wrap { position: relative; }
+    video { width: 100%; background: #000; display: block; }
+    /* 默认录像缺失时覆盖在播放器上的提示 */
+    #videoHint { display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+                 background: rgba(0,0,0,.8); color: #fff; align-items: center; justify-content: center;
+                 text-align: center; padding: 16px; font-size: 15px; line-height: 1.6; }
+    .bar { margin: 12px 0; }
+    button { padding: 6px 14px; margin-right: 8px; font-size: 14px; cursor: pointer; }
+    input[type="text"] { padding: 6px 10px; width: min(62%, 520px); font-size: 14px; }
+    .hint { color: #666; font-size: 13px; }
+    #noteList { list-style: none; padding: 0; margin: 0; }
+    .note-item { display: flex; align-items: center; gap: 12px; border: 1px solid #ddd; padding: 8px 10px; margin-bottom: 6px; cursor: pointer; }
+    .note-item:hover { background: #f6f6f6; }
+    .note-time { color: #0a7; font-family: Consolas, monospace; min-width: 60px; }
+    .note-text { flex: 1; word-break: break-all; }
+    .del-btn { color: #c00; padding: 2px 8px; }
+    .empty { color: #999; padding: 12px 0; }
+    .seek { width: calc(100% - 140px); vertical-align: middle; accent-color: #0a7; }
+  </style>
+</head>
+<body>
+  <h1>交通录像标记小工具</h1>
+
+  <!-- 载入本地录像：按钮触发隐藏的 file input，全程 file:// 可用 -->
+  <div class="bar">
+    <button id="loadBtn" type="button">载入录像</button>
+    <input id="videoFile" type="file" accept="video/mp4,video/*" style="display:none">
+    <span>当前视频：<strong id="videoName">京津道路车流.mp4</strong></span>
+  </div>
+
+  <!-- 视频播放器；src 默认为同目录录像，加载失败时由 videoHint 覆盖提示 -->
+  <div class="video-wrap">
+    <video id="video" src="京津道路车流.mp4" controls preload="metadata"></video>
+    <div id="videoHint">未找到默认录像，请点击上方「载入录像」选择视频</div>
+  </div>
+
+  <!-- 可拖动进度条（原生 controls 也带一条，这里额外提供，跳转逻辑复用同一 video） -->
+  <div class="bar">
+    <input id="seekBar" class="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度">
+    <span>当前时间：<strong id="currentTime">00:00.0</strong></span>
+  </div>
+
+  <!-- 播放控制 -->
+  <div class="bar">
+    <button id="playPauseBtn" type="button">播放</button>
+  </div>
+
+  <!-- 添加备注 -->
+  <div class="bar">
+    <input id="noteInput" type="text" placeholder="输入备注，例如：留意右侧车道的白车" maxlength="200">
+    <button id="saveBtn" type="button">保存备注</button>
+  </div>
+  <div class="hint">提示：按 Enter 也可保存。备注会自动记录当前播放时刻，并按当前视频单独保存。</div>
+
+  <!-- 导入导出 -->
+  <div class="bar">
+    <button id="exportBtn" type="button">导出 JSON</button>
+    <button id="importBtn" type="button">导入 JSON</button>
+    <input id="importFile" type="file" accept=".json,application/json" style="display:none">
+  </div>
+
+  <!-- 备注列表 -->
+  <h2>备注列表（按时间升序，点击任意一条跳回对应时刻）</h2>
+  <ul id="noteList"></ul>
+
+  <script>
+    (function () {
+      'use strict';
+
+      // ===== 常量 =====
+      var DEFAULT_VIDEO_FILE = '京津道路车流.mp4';   // 默认同目录录像文件名
+      // 默认录像走相对路径，拿不到 File.size；这里用 ffprobe 核实的字节数，
+      // 使得"自动加载"与"手动选中同一文件"生成完全相同的 key，备注不会分家。
+      var DEFAULT_VIDEO_SIZE = 1661596;
+      var KEY_PREFIX = 'lee_notes__';                // localStorage key 前缀
+
+      // ===== DOM 元素缓存 =====
+      var video = document.getElementById('video');
+      var playPauseBtn = document.getElementById('playPauseBtn');
+      var currentTimeEl = document.getElementById('currentTime');
+      var noteInput = document.getElementById('noteInput');
+      var saveBtn = document.getElementById('saveBtn');
+      var exportBtn = document.getElementById('exportBtn');
+      var importBtn = document.getElementById('importBtn');
+      var importFile = document.getElementById('importFile');
+      var noteList = document.getElementById('noteList');
+      var seekBar = document.getElementById('seekBar');
+      var loadBtn = document.getElementById('loadBtn');
+      var videoFileInput = document.getElementById('videoFile');
+      var videoNameEl = document.getElementById('videoName');
+      var videoHint = document.getElementById('videoHint');
+
+      // ===== 运行时状态 =====
+      var notes = [];              // 内存中的备注数组，元素形如 { id, time, text }
+      var storageKey = '';         // 当前视频对应的 localStorage key（切换视频时重建）
+      var currentVideoName = '';   // 当前视频文件名
+      var currentVideoSize = 0;    // 当前视频字节数
+      var currentObjectUrl = null; // 当前 objectURL（仅手动载入时有值）
+      var defaultTimer = null;     // 默认录像 3 秒探测定时器
+      var isDefaultVideo = true;   // 当前是否为默认录像
+      var pendingReset = false;    // 切换后待元数据就绪时兜底归零
+
+      /**
+       * 生成当前视频的 localStorage key：前缀 + 文件名 + 文件大小
+       */
+      function buildKey(name, size) {
+        return KEY_PREFIX + name + '__' + size;
+      }
+
+      /**
+       * 生成唯一 ID，用于区分不同备注（连续添加互不覆盖）
+       */
+      function genId() {
+        return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+      }
+
+      /**
+       * 把秒数格式化为 mm:ss.s（如 8.4 -> "00:08.4"）
+       * 先换算成 0.1 秒整数，避免 59.97 被格式化成 "00:60.0"
+       */
+      function formatTime(seconds) {
+        if (typeof seconds !== 'number' || !isFinite(seconds) || seconds < 0) {
+          seconds = 0;
+        }
+        var tenths = Math.round(seconds * 10);           // 总 0.1 秒数
+        var minutes = Math.floor(tenths / 600);
+        var rest = tenths - minutes * 600;
+        var secs = Math.floor(rest / 10);
+        var frac = rest % 10;
+        var mm = (minutes < 10 ? '0' : '') + minutes;
+        var ss = (secs < 10 ? '0' : '') + secs;
+        return mm + ':' + ss + '.' + frac;
+      }
+
+      /**
+       * 从 localStorage 读取"当前视频"的备注；解析失败或格式非法时返回空数组
+       */
+      function loadNotes() {
+        try {
+          var raw = localStorage.getItem(storageKey);
+          if (!raw) return [];
+          var data = JSON.parse(raw);
+          if (!Array.isArray(data)) return [];
+          return data
+            .filter(function (n) {
+              return n && typeof n.time === 'number' && isFinite(n.time) &&
+                     n.time >= 0 && typeof n.text === 'string';
+            })
+            .map(function (n) {
+              return { id: n.id || genId(), time: n.time, text: n.text };
+            });
+        } catch (e) {
+          return [];
+        }
+      }
+
+      /**
+       * 把备注数组写回"当前视频"的 localStorage；失败时给出提示
+       */
+      function saveNotes() {
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(notes));
+          return true;
+        } catch (e) {
+          alert('备注保存失败：浏览器本地存储不可用（可能处于无痕模式或空间已满）。请先点「导出 JSON」备份。');
+          return false;
+        }
+      }
+
+      /**
+       * 按时间升序排序
+       */
+      function sortNotes() {
+        notes.sort(function (a, b) { return a.time - b.time; });
+      }
+
+      /**
+       * 渲染备注列表：每条含时间戳、备注文字、删除按钮
+       * 文字用 textContent 写入，避免被当作 HTML 解析
+       */
+      function renderList() {
+        noteList.innerHTML = '';
+        if (notes.length === 0) {
+          var emptyLi = document.createElement('li');
+          emptyLi.className = 'empty';
+          emptyLi.textContent = '暂无备注。把视频暂停在想记录的画面，输入一句话后点「保存备注」。';
+          noteList.appendChild(emptyLi);
+          return;
+        }
+        notes.forEach(function (note) {
+          var li = document.createElement('li');
+          li.className = 'note-item';
+
+          var timeSpan = document.createElement('span');
+          timeSpan.className = 'note-time';
+          timeSpan.textContent = formatTime(note.time);
+
+          var textSpan = document.createElement('span');
+          textSpan.className = 'note-text';
+          textSpan.textContent = note.text;
+
+          var delBtn = document.createElement('button');
+          delBtn.type = 'button';
+          delBtn.className = 'del-btn';
+          delBtn.textContent = '删除';
+          delBtn.addEventListener('click', function (e) {
+            e.stopPropagation();          // 阻止冒泡，避免触发条目跳转
+            deleteNote(note.id);
+          });
+
+          li.appendChild(timeSpan);
+          li.appendChild(textSpan);
+          li.appendChild(delBtn);
+          li.addEventListener('click', function () { jumpTo(note.time); });
+          noteList.appendChild(li);
+        });
+      }
+
+      /**
+       * 切换视频上下文：重建 key、按新 key 读取备注并整体重渲染，绝不混入上一个视频的备注
+       */
+      function switchVideoContext(name, size, isDefault) {
+        currentVideoName = name;
+        currentVideoSize = size;
+        isDefaultVideo = isDefault;
+        storageKey = buildKey(name, size);
+        notes = loadNotes();
+        sortNotes();
+        renderList();
+        videoNameEl.textContent = name;
+      }
+
+      /**
+       * 播放器重置：暂停、时间轴归零、进度条归零
+       */
+      function resetPlayback() {
+        video.pause();
+        video.currentTime = 0;
+        pendingReset = true;               // 元数据就绪时再兜底归零一次
+        syncPlayBtn();
+        currentTimeEl.textContent = formatTime(0);
+        seekBar.value = 0;
+      }
+
+      /**
+       * 显示 / 隐藏播放器上的提示遮罩
+       */
+      function showHint(msg) {
+        videoHint.textContent = msg;
+        videoHint.style.display = 'flex';
+      }
+      function hideHint() {
+        videoHint.style.display = 'none';
+      }
+
+      /**
+       * 添加备注：取 video.currentTime 作为时刻，追加后排序、持久化、重绘
+       */
+      function addNote() {
+        var text = noteInput.value.trim();
+        if (!text) {
+          alert('请先输入备注内容。');
+          noteInput.focus();
+          return;
+        }
+        var note = { id: genId(), time: video.currentTime, text: text };
+        notes.push(note);
+        sortNotes();
+        if (saveNotes()) {
+          renderList();
+          noteInput.value = '';
+          noteInput.focus();
+        } else {
+          // 持久化失败则回滚，避免出现「界面有、刷新后丢失」的不一致
+          notes = notes.filter(function (n) { return n.id !== note.id; });
+        }
+      }
+
+      /**
+       * 删除指定 ID 的备注
+       */
+      function deleteNote(id) {
+        notes = notes.filter(function (n) { return n.id !== id; });
+        saveNotes();
+        renderList();
+      }
+
+      /**
+       * 跳转到指定时刻，并在定位完成后恢复跳转前的播放状态
+       */
+      function jumpTo(t) {
+        var wasPlaying = !video.paused;
+        var onSeeked = function () {
+          video.removeEventListener('seeked', onSeeked);
+          // seek 完成后才恢复：原本在播放则继续播，原本暂停则保持暂停
+          if (wasPlaying && video.paused) {
+            var p = video.play();
+            if (p && typeof p.catch === 'function') {
+              p.catch(function () { /* 浏览器交互策略限制时忽略 */ });
+            }
+          }
+        };
+        // 先注册监听器，再设置 currentTime，避免 seeked 被同步派发时错过
+        video.addEventListener('seeked', onSeeked);
+        video.currentTime = t;
+      }
+
+      /**
+       * 播放 / 暂停切换
+       */
+      function togglePlay() {
+        if (video.paused || video.ended) {
+          var p = video.play();
+          if (p && typeof p.catch === 'function') p.catch(function () {});
+        } else {
+          video.pause();
+        }
+      }
+
+      /**
+       * 同步播放按钮文字
+       */
+      function syncPlayBtn() {
+        playPauseBtn.textContent = video.paused ? '播放' : '暂停';
+      }
+
+      /**
+       * 导出全部备注为 JSON 文件（file:// 下用 Blob + a.download，不依赖服务器）
+       * 附加 videoName / videoSize，便于核对备注属于哪段录像
+       */
+      function exportJSON() {
+        var payload = {
+          video: currentVideoName,        // 兼容旧版字段名
+          videoName: currentVideoName,    // 新增：明确标注录像文件名
+          videoSize: currentVideoSize,
+          exportedAt: new Date().toISOString(),
+          notes: notes
+        };
+        var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        var d = new Date();
+        var stamp = '' + d.getFullYear() +
+          ('0' + (d.getMonth() + 1)).slice(-2) +
+          ('0' + d.getDate()).slice(-2);
+        a.download = '备注_' + currentVideoName.replace(/\.mp4$/i, '') + '_' + stamp + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+
+      /**
+       * 导入 JSON：校验结构后按 id 合并去重，避免覆盖已有备注
+       */
+      function importJSON(file) {
+        var reader = new FileReader();
+        reader.onload = function (e) {
+          try {
+            var text = e.target.result;
+            if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // 兼容带 BOM 的 UTF-8
+            var data = JSON.parse(text);
+            var incoming = Array.isArray(data) ? data : (data && Array.isArray(data.notes) ? data.notes : null);
+            if (!incoming) {
+              alert('导入失败：JSON 中没有找到备注数组。');
+              return;
+            }
+            var valid = incoming
+              .filter(function (n) {
+                return n && typeof n.time === 'number' && isFinite(n.time) && n.time >= 0 &&
+                       typeof n.text === 'string' && n.text.trim();
+              })
+              .map(function (n) {
+                return { id: n.id || genId(), time: n.time, text: n.text.trim() };
+              });
+            if (valid.length === 0) {
+              alert('导入失败：JSON 中没有有效的备注条目。');
+              return;
+            }
+            var seen = {};
+            notes.forEach(function (n) { seen[n.id] = true; });
+            var added = 0;
+            valid.forEach(function (n) {
+              if (!seen[n.id]) { notes.push(n); seen[n.id] = true; added++; }
+            });
+            sortNotes();
+            saveNotes();
+            renderList();
+            alert('导入完成：新增 ' + added + ' 条，跳过重复 ' + (valid.length - added) + ' 条。');
+          } catch (err) {
+            alert('导入失败：无法解析 JSON（' + err.message + '）。');
+          }
+        };
+        reader.onerror = function () { alert('导入失败：无法读取所选文件。'); };
+        reader.readAsText(file, 'utf-8');
+      }
+
+      // ===== 事件绑定 =====
+      playPauseBtn.addEventListener('click', togglePlay);
+      saveBtn.addEventListener('click', addNote);
+      noteInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') addNote();
+      });
+      exportBtn.addEventListener('click', exportJSON);
+      importBtn.addEventListener('click', function () { importFile.click(); });
+      importFile.addEventListener('change', function () {
+        var file = importFile.files && importFile.files[0];
+        if (file) importJSON(file);
+        importFile.value = '';   // 清空以便重复选择同一文件
+      });
+
+      /**
+       * 载入本地录像：用 objectURL 直接喂给 video，不读文件内容、不起服务器
+       */
+      loadBtn.addEventListener('click', function () { videoFileInput.click(); });
+      videoFileInput.addEventListener('change', function () {
+        var file = videoFileInput.files && videoFileInput.files[0];
+        videoFileInput.value = '';              // 清空以便重复选择同一文件
+        if (!file) return;
+
+        // 取消默认录像探测，避免手动载入后 3 秒定时器又弹提示
+        if (defaultTimer) { clearTimeout(defaultTimer); defaultTimer = null; }
+
+        // 切换前释放旧的 objectURL，防止内存泄漏
+        if (currentObjectUrl) {
+          URL.revokeObjectURL(currentObjectUrl);
+          currentObjectUrl = null;
+        }
+
+        currentObjectUrl = URL.createObjectURL(file);
+        hideHint();
+        switchVideoContext(file.name, file.size, false);   // 按新视频重建 key 与列表
+        resetPlayback();
+        video.src = currentObjectUrl;
+        video.load();
+      });
+
+      // 视频元数据就绪：清掉默认探测定时器、隐藏提示、按需兜底归零
+      video.addEventListener('loadedmetadata', function () {
+        if (defaultTimer) { clearTimeout(defaultTimer); defaultTimer = null; }
+        hideHint();
+        if (pendingReset) {
+          video.currentTime = 0;
+          pendingReset = false;
+          currentTimeEl.textContent = formatTime(0);
+          seekBar.value = 0;
+        }
+      });
+
+      video.addEventListener('play', syncPlayBtn);
+      video.addEventListener('pause', syncPlayBtn);
+      video.addEventListener('ended', syncPlayBtn);
+
+      /**
+       * 把播放进度同步到进度条；正在手动拖动时不覆盖，避免跳动
+       */
+      var isSeeking = false;
+      video.addEventListener('timeupdate', function () {
+        currentTimeEl.textContent = formatTime(video.currentTime);
+        if (!isSeeking && isFinite(video.duration) && video.duration > 0) {
+          seekBar.value = Math.round(video.currentTime / video.duration * 1000);
+        }
+      });
+      // 用户开始拖动进度条
+      seekBar.addEventListener('mousedown', function () { isSeeking = true; });
+      seekBar.addEventListener('touchstart', function () { isSeeking = true; }, { passive: true });
+      /**
+       * 进度条拖动时跳转视频到对应比例位置
+       */
+      function applySeek() {
+        if (isFinite(video.duration) && video.duration > 0) {
+          video.currentTime = Number(seekBar.value) / 1000 * video.duration;
+        }
+      }
+      seekBar.addEventListener('input', applySeek);
+      seekBar.addEventListener('change', function () { applySeek(); isSeeking = false; });
+
+      // 加载失败（默认录像缺失或文件损坏）：在播放器位置给出提示
+      video.addEventListener('error', function () {
+        if (isDefaultVideo) {
+          showHint('未找到默认录像，请点击上方「载入录像」选择视频');
+        } else {
+          showHint('视频加载失败，请点击上方「载入录像」重新选择视频');
+        }
+      });
+
+      // 页面卸载时释放 objectURL
+      window.addEventListener('unload', function () {
+        if (currentObjectUrl) {
+          URL.revokeObjectURL(currentObjectUrl);
+          currentObjectUrl = null;
+        }
+      });
+
+      // ===== 初始化：先按默认录像建立上下文，再探测 3 秒 =====
+      switchVideoContext(DEFAULT_VIDEO_FILE, DEFAULT_VIDEO_SIZE, true);
+      defaultTimer = setTimeout(function () {
+        if (video.readyState === 0) {
+          showHint('未找到默认录像，请点击上方「载入录像」选择视频');
+        }
+      }, 3000);
+    })();
+  </script>
+</body>
+</html>
